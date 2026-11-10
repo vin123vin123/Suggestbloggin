@@ -1,1 +1,7 @@
-
+fastapi==0.110.0
+uvicorn==0.28.0
+passlib[bcrypt]==1.7.4
+pyjwt==2.8.0
+pydantic==2.6.4
+pymongo==4.6.2
+dnspython==2.6.1
