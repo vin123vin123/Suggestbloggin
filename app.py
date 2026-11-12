@@ -2,6 +2,7 @@ import os
 import random
 import datetime
 import time
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
@@ -29,6 +30,7 @@ ADMIN_PLAIN_PASSWORD = "SecretAdminPassword123"
 
 header_scheme = APIKeyHeader(name="Authorization", auto_error=False)
 
+# --- MODELS ---
 class BlogCreate(BaseModel):
     title: str
     content: str
@@ -37,20 +39,32 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-def get_db_collection():
+class BlogSettings(BaseModel):
+    blog_title: Optional[str] = "My Tech Blog"
+    theme_color: Optional[str] = "#ffffff"
+    posts_per_page: Optional[int] = 10
+
+# --- DATABASE HELPERS ---
+def get_db():
     if not MONGO_URI:
         raise HTTPException(status_code=500, detail="Database URL (MONGO_URI) missing.")
     client = MongoClient(MONGO_URI)
-    db = client["blog_db"]
-    return db["blogs"]
+    return client["blog_db"]
 
+def get_db_collection():
+    return get_db()["blogs"]
+
+def get_settings_collection():
+    return get_db()["settings"]
+
+# --- AUTHENTICATION ---
 def verify_token(request: Request, header_value: str = Depends(header_scheme)):
     if request.method == "OPTIONS":
         return None
     if not header_value or not header_value.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing or malformed")
     
-    token = header_value.split(" ")
+    token = header_value.split(" ")[1]
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
@@ -60,6 +74,7 @@ def verify_token(request: Request, header_value: str = Depends(header_scheme)):
     except jwt.PyJWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate signature")
 
+# --- ADMIN ROUTES ---
 @app.post("/api/admin/login/")
 def login(data: LoginRequest):
     if not data.password or data.password.strip() == "":
@@ -86,26 +101,53 @@ def create_blog(blog: BlogCreate, username: str = Depends(verify_token)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Write error: {str(e)}")
 
+# --- NEW: SAVE PERMANENT SETTINGS ---
+@app.post("/api/admin/settings/")
+def update_settings(settings: BlogSettings, username: str = Depends(verify_token)):
+    try:
+        settings_col = get_settings_collection()
+        settings_data = settings.dict()
+        settings_data["updated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+        
+        # Upsert ensures only ONE global settings document exists and updates it
+        settings_col.update_one(
+            {"_id": "global_config"},
+            {"$set": settings_data},
+            upsert=True
+        )
+        return {"status": "Success", "message": "Settings permanently saved.", "settings": settings_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Settings write error: {str(e)}")
+
+# --- PUBLIC ROUTES ---
+@app.get("/api/settings/")
+def get_settings():
+    try:
+        settings_col = get_settings_collection()
+        config = settings_col.find_one({"_id": "global_config"}, {"_id": 0})
+        
+        # Return default values if you haven't saved custom settings yet
+        if not config:
+            return BlogSettings().dict()
+        return config
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Settings read failure: {str(e)}")
+
 # --- STABILIZED TIME-LOCKED READ-ONLY ROUTE ---
 @app.get("/api/blogs/shuffled/")
 def get_shuffled_blogs():
     try:
         collection = get_db_collection()
         
-        # 1. Fetch the raw repository stack (limiting to newest 50 entries)
         cursor = collection.find({}, {"_id": 0}).sort("created_at", -1).limit(50)
         blogs = list(cursor)
         
         if not blogs:
             return []
 
-        # 2. Build the exact 2-hour structural alignment key seed
-        # 7200 seconds = exactly 2 hours. This changes integer value precisely every 2 hours.
         current_epoch_time = time.time()
         two_hour_window_block = int(current_epoch_time // 7200)
         
-        # 3. Freeze random execution pattern state to this window block index
-        # This keeps the layout identical for everyone and across restarts for the full 2 hours
         rng = random.Random(two_hour_window_block)
         rng.shuffle(blogs)
         
